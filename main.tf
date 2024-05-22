@@ -1,4 +1,3 @@
-#определяем провайдера
 terraform {
   required_providers {
     libvirt = {
@@ -14,71 +13,75 @@ provider "libvirt" {
     uri = "qemu:///system"
 }
 
-#корневая директория для вм и образов
+#пул для квм
 resource "libvirt_pool" "pool" {
-  name = "dir"
+  name = "kubecluster"
   type = "dir"
-  path = "/home/flame/tfkvm"
+  path = var.pool_path
 }
 
-#образ для клауд инит
-resource "libvirt_volume" "image-cloud" {
-  name   = "debian-bookworm-cloud"
-  pool   = libvirt_pool.pool.name
-  format = "qcow2"
-  source = "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-generic-amd64.qcow2"
-}
-
-#основной диск ВМ
-#размер 10 гигабайт, указано так для наглядности
-resource "libvirt_volume" "root" {
-  name           = "disk-root"
-  pool           = libvirt_pool.pool.name
-  base_volume_id = libvirt_volume.image-cloud.id
-  size           = 10 * 1024 * 1024 * 1024
-}
-
-#конфиг клауд инит
+#шаблон инициализации через клауд инит и его конфиг
 data "template_file" "user_data" {
-  template = file("./userdata-cloud-init.cfg")
+  template = file("userdata-cloud-init.cfg")
 }
 
-#подключение iso в ВМ
-resource "libvirt_cloudinit_disk" "commoninit" {
-  name           = "commoninit.iso"
+#создаем клауд инит образ
+resource "libvirt_cloudinit_disk" "cloud_init" {
+  name           = "cloud_init.iso"
   pool           = libvirt_pool.pool.name
   user_data      = data.template_file.user_data.rendered
 }
 
-#Описание ВМ
-resource "libvirt_domain" "vm" {
-  name       = "debian01"
-  memory     = 2048
-  vcpu       = 2
+#создаем образ основного диска виртуальной машины из клауд образа 
+resource "libvirt_volume" "cloud_image" {
+  name   = var.cloud_image.name
+  pool   = libvirt_pool.pool.name
+  format = "qcow2"
+  source = var.cloud_image.url
+}
+
+#создаем основной диск для виртуальных машин
+resource "libvirt_volume" "master-root" {
+  for_each       = var.masters
+
+  name           = each.value.disk-name
+  pool           = libvirt_pool.pool.name
+  base_volume_id = libvirt_volume.cloud_image.id
+  size           = each.value.disk
+}
+
+#создаем виртуальные машины через for_each
+resource "libvirt_domain" "master-vm" {
+  for_each       = var.masters
+
+  name       = each.value.name
+  vcpu       = each.value.cpu
+  memory     = each.value.ram
   qemu_agent = true
   autostart  = true
-  cloudinit  = libvirt_cloudinit_disk.commoninit.id
+  cloudinit  = libvirt_cloudinit_disk.cloud_init.id
 
   network_interface {
-    bridge         = "br0"
+    bridge         = each.value.bridge
     wait_for_lease = true
   }
 
   disk {
-    volume_id = libvirt_volume.root.id
+    volume_id = libvirt_volume.master-root[each.key].id
   }
 
-  depends_on = [ libvirt_volume.root ]
+  depends_on = [ libvirt_volume.master-root ]
+
 }
 
-#Вывод имени ВМ
+#выводим полученные имена виртуальных машин в гипервизоре
 output "vm_name" {
-  value       = libvirt_domain.vm.name
+  value       = values(libvirt_domain.master-vm)[*].name
   description = "VM name"
 }
 
-#Вывод адреса ВМ
+#выводим айпи адреса виртуальных машин в гипервизоре
 output "vm_ip" {
-  value       = libvirt_domain.vm.network_interface[0].addresses.0
+  value       = values(libvirt_domain.master-vm)[*].network_interface[0].addresses.0
   description = "Interface IPs"
 }
